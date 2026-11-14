@@ -1,4 +1,5 @@
 # Remaining game work
+- [ ] Extend prologue: seventh-floor landing, elevator, street, car ignition; fix wall rug; verify departure gates and rendering.
 - [ ] Image touch controls and inventory
 - [ ] Landscape lock with browser fallback
 - [ ] Bear skins and visible model verification

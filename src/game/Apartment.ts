@@ -10,6 +10,7 @@ import tileUrl from "@/assets/apartment/tile.jpg";
 import rugUrl from "@/assets/apartment/rug.jpg";
 import viewUrl from "@/assets/apartment/window-view.jpg";
 import photoUrl from "@/assets/apartment/photo.jpg";
+import { departureNext, canBeginMainGame, type DepartureStage, type DepartureAction } from "./departure-rules";
 
 export interface AptHud { prompt: string; objective: string; subtitle: string; paused: boolean; flashlight: boolean }
 export interface AptCallbacks { onHud: (h: AptHud) => void; onProgress: (p: number) => void; onReady: () => void; onDone: () => void }
@@ -23,7 +24,9 @@ const WALK = 1.9, RUN = 3.2;
 function canvasTex(w: number, h: number, draw: (g: CanvasRenderingContext2D) => void, repeat = true) {
   const c = document.createElement("canvas");
   c.width = w; c.height = h;
-  draw(c.getContext("2d")!);
+  const context = c.getContext("2d");
+  if (!context) throw new Error("Canvas context unavailable");
+  draw(context);
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   if (repeat) t.wrapS = t.wrapT = THREE.RepeatWrapping;
@@ -112,6 +115,15 @@ export class Apartment {
   private hand: { keys: THREE.Object3D; flash: THREE.Object3D } = { keys: new THREE.Object3D(), flash: new THREE.Object3D() };
   private door!: THREE.Group;
   private doorOpen = 0;
+  private departure: DepartureStage = "apartment";
+  private departureTime = 0;
+  private liftDoors: THREE.Mesh[] = [];
+  private liftOpening = 0;
+  private liftDisplay: THREE.CanvasTexture | null = null;
+  private floorDisplay: THREE.CanvasTexture | null = null;
+  private displayedFloor = 7;
+  private headlights: THREE.SpotLight[] = [];
+  private engine: OscillatorNode | null = null;
 
   constructor(private container: HTMLElement, private cb: AptCallbacks, private lang: Lang) {
     this.isTouch = window.matchMedia("(pointer: coarse)").matches;
@@ -293,11 +305,7 @@ export class Apartment {
       if (ax === "z") { this.box(0.18, 0.08, 1.1, jamb, x, 2.15, z); this.box(0.18, 2.15, 0.06, jamb, x, 0, z - 0.52); this.box(0.18, 2.15, 0.06, jamb, x, 0, z + 0.52); }
       else { this.box(1.0, 0.08, 0.18, jamb, x, 2.15, z); this.box(0.06, 2.15, 0.18, jamb, x - 0.47, 0, z); this.box(0.06, 2.15, 0.18, jamb, x + 0.47, 0, z); }
     }
-    // outside: stairwell box beyond front door
-    const stair = this.mat({ color: "#3e5a4e", roughness: 1 });
-    this.box(0.1, H, 3, stair, 10.6, 0, 4.5);
-    this.box(1.6, 0.02, 3, this.mat({ color: "#4a4640" }), 9.8, -0.01, 4.5);
-    const stairLight = new THREE.PointLight("#b8ffcc", 0.6, 4, 2); stairLight.position.set(9.9, 2.4, 4.5); sc.add(stairLight);
+    this.buildDeparture();
 
     this.living();
     this.kitchen();
@@ -375,9 +383,8 @@ export class Apartment {
     this.cyl(0.14, 0.24, 0.3, this.mat({ color: "#e8c890", emissive: "#ffb060", emissiveIntensity: 0.6, side: THREE.DoubleSide, transparent: true, opacity: 0.95 }), 4.55, 1.45, 5.2, 18);
     // wall clock + carpet on the wall (very 80s)
     const clock = this.cyl(0.18, 0.18, 0.04, this.mat({ color: "#efe8d8" }), 0.07, 1.9, 1.4, 24); clock.rotation.z = Math.PI / 2;
-    const wallRug = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 1.4), this.mat({ map: this.tex(rugUrl), roughness: 1 }));
-    wallRug.position.set(3.6 + 0.45, 1.55, 3.1); wallRug.rotation.y = -Math.PI / 2; wallRug.scale.set(1, 1, 1);
-    wallRug.position.x = 4.93; this.scene.add(wallRug);
+    const wallRug = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 1.2), this.mat({ map: this.tex(rugUrl), roughness: 1 }));
+    wallRug.position.set(4.93, 1.55, 2.35); wallRug.rotation.y = -Math.PI / 2; this.scene.add(wallRug);
     // chandelier
     this.cyl(0.01, 0.01, 0.35, brass, 2.4, H - 0.35, 3.1, 6);
     this.cyl(0.25, 0.1, 0.12, this.mat({ color: "#f4ecd8", emissive: "#ffd8a0", emissiveIntensity: 0.8 }), 2.4, H - 0.47, 3.1, 20);
@@ -467,11 +474,159 @@ export class Apartment {
     this.spot("keys", new THREE.Vector3(8.8, 1.3, 3.5), () => this.l("Взять ключи от машины и фонарик", "Take the car keys and flashlight"), () => this.ready() && !this.done.has("keys"), () => {
       this.done.add("keys"); this.sfx.pickup(); keys.visible = false; torch.visible = false; this.flashOn = true; this.say("a_keys");
     });
-    this.spot("door", new THREE.Vector3(8.9, 1.2, 4.5), () => this.l("Выйти в подъезд", "Step out into the stairwell"), () => this.done.has("keys") && !this.finished, () => {
-      this.finished = true; this.sfx.door();
+    this.spot("door", new THREE.Vector3(8.9, 1.2, 4.5), () => this.l("Выйти в подъезд", "Step out into the stairwell"), () => this.done.has("keys") && !this.done.has("door"), () => {
+      this.done.add("door"); this.sfx.door();
       this.boxes = this.boxes.filter((b) => !(b[0] === 8.85 && b[1] === 4.0));
-      this.say("a_door", () => this.cb.onDone());
+      this.say("a_door");
     });
+  }
+
+  private sign(text: string, x: number, y: number, z: number, width = 0.5, height = 0.3, rotation = 0) {
+    const texture = canvasTex(256, 128, (g) => {
+      g.fillStyle = "#182421"; g.fillRect(0, 0, 256, 128);
+      g.fillStyle = "#dbe6d2"; g.font = "bold 64px monospace"; g.textAlign = "center"; g.textBaseline = "middle";
+      g.fillText(text, 128, 64);
+    }, false);
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), new THREE.MeshBasicMaterial({ map: texture }));
+    mesh.position.set(x, y, z); mesh.rotation.y = rotation; this.scene.add(mesh);
+    return texture;
+  }
+
+  private buildDeparture() {
+    const plaster = this.mat({ map: plasterTex(), color: "#b5b8ac" });
+    const green = this.mat({ map: plasterTex(), color: "#52786b" });
+    const concrete = this.mat({ map: linoTex(), color: "#777c7b", roughness: 0.85 });
+    const metal = this.mat({ map: woodTex("#717a78", "#313735"), metalness: 0.65, roughness: 0.38 });
+    const dark = this.mat({ color: "#202625" });
+    const wall = (w: number, d: number, x: number, z: number) => {
+      this.box(w, H, d, plaster, x, 0, z, true);
+      this.box(w + 0.01, 1.15, d + 0.01, green, x, 0, z);
+    };
+    this.box(7, 0.1, 5, concrete, 12.5, -0.1, 5.5);
+    this.box(7, 0.1, 5, plaster, 12.5, H, 5.5);
+    wall(7, 0.14, 12.5, 8);
+    wall(3, 0.14, 10.5, 3); wall(2.4, 0.14, 14.8, 3);
+    wall(0.14, 2, 16, 4); wall(0.14, 1.3, 16, 7.35);
+    wall(0.14, 2, 9, 7);
+    this.floorDisplay = this.sign("7", 10.4, 1.9, 3.08, 0.5, 0.45);
+    this.sign(this.l("ЛИФТ", "LIFT"), 12.8, 2.46, 3.1, 0.8, 0.22);
+    this.liftDisplay = this.sign("7", 12.8, 2.15, 3.11, 0.32, 0.22);
+    // Closed neighboring apartment doors, meter cabinet, stair railing and mailboxes.
+    for (const x of [10.3, 14.4]) {
+      this.box(1, 2.12, 0.1, dark, x, 0, 7.9);
+      this.sign(x === 10.3 ? "27" : "28", x, 1.8, 7.83, 0.22, 0.15, Math.PI);
+      this.box(0.12, 0.03, 0.05, metal, x + 0.3, 1, 7.81);
+    }
+    this.box(0.7, 0.8, 0.14, metal, 15.1, 1.1, 3.1);
+    for (let i = 0; i < 6; i++) this.box(0.48, 0.22, 0.16, metal, 9.12, 0.7 + i * 0.23, 6.5);
+    for (let i = 0; i < 8; i++) this.box(0.03, 0.9, 0.03, metal, 10 + i * 0.16, 0, 7.25);
+    this.box(1.25, 0.04, 0.04, metal, 10.55, 0.9, 7.25);
+    const lamp = new THREE.MeshBasicMaterial({ color: "#e6f2d5" });
+    this.box(1.2, 0.04, 0.2, lamp, 12.4, 2.6, 5.5);
+    const light = new THREE.PointLight("#d5eac7", this.isTouch ? 2.5 : 5, 9, 1.6);
+    light.position.set(12.4, 2.5, 5.2); this.scene.add(light);
+    // Lift cabin and sliding leaves. Its footprint is walkable only through the open doorway.
+    this.box(1.6, 0.08, 2.2, concrete, 12.8, -0.08, 1.9);
+    this.box(1.6, 0.08, 2.2, lamp, 12.8, 2.3, 1.9);
+    this.box(0.12, 2.35, 2.2, metal, 11.94, 0, 1.9, true);
+    this.box(0.12, 2.35, 2.2, metal, 13.66, 0, 1.9, true);
+    this.box(1.8, 2.35, 0.12, metal, 12.8, 0, 0.78, true);
+    this.box(1.5, 0.04, 0.04, metal, 12.8, 0.9, 0.89);
+    for (const x of [12.4, 13.2]) this.liftDoors.push(this.box(0.8, 2.05, 0.06, metal, x, 0, 3));
+    this.box(0.12, 0.24, 0.04, metal, 13.86, 1.2, 3.1);
+    this.box(0.055, 0.055, 0.02, lamp, 13.86, 1.28, 3.14);
+    this.box(0.06, 0.45, 0.24, dark, 13.57, 1.0, 1.75);
+    this.sign("1", 13.53, 1.25, 1.75, 0.14, 0.18, -Math.PI / 2);
+    this.spot("liftCall", new THREE.Vector3(13.86, 1.32, 3.14), () => this.l("Вызвать лифт", "Call the elevator"), () => this.departure === "landing", () => { this.advanceDeparture("callLift"); this.sfx.click(); this.sfx.door(); });
+    this.spot("liftPanel", new THREE.Vector3(13.53, 1.25, 1.75), () => this.l("Нажать 1 — спуститься", "Press 1 — go down"), () => this.departure === "liftOpen" && this.pos.z < 2.8, () => {
+      this.advanceDeparture("descend"); this.pos.set(12.8, 0, 1.9); this.yaw = Math.PI; this.pitch = 0; this.sfx.door(); this.motor(48, 0.025);
+      this.caption("Седьмой… шестой… Только бы лифт не застрял.", "Seven… six… Please don't get stuck.");
+    });
+    // Ground-floor exit: glazed steel door, canopy and a wet courtyard.
+    this.box(0.06, 2.3, 1.6, metal, 16, 0, 5.8);
+    this.box(0.07, 1.1, 1.3, this.mat({ color: "#55707a", transparent: true, opacity: 0.35 }), 15.96, 0.95, 5.8);
+    this.sign(this.l("ВЫХОД", "EXIT"), 15.88, 2.45, 5.8, 0.8, 0.22, -Math.PI / 2);
+    this.spot("buildingExit", new THREE.Vector3(15.85, 1.35, 5.8), () => this.l("Открыть дверь на улицу", "Open the street door"), () => this.departure === "ground", () => {
+      this.advanceDeparture("leaveBuilding"); this.sfx.door(); this.pos.set(17.2, 0, 5.8); this.yaw = -Math.PI / 2; this.pitch = 0;
+      this.rain.uniforms.uCenter.value.set(24, 2, 5);
+      this.caption("Моя машина у фонаря. Ключи со мной.", "My car is under the streetlight. I've got the keys.");
+    });
+    this.box(20, 0.1, 18, this.mat({ map: plasterTex(), color: "#354047", roughness: 0.22, metalness: 0.2 }), 26, -0.11, 5);
+    this.box(2, 0.08, 12, concrete, 17, -0.08, 6);
+    this.box(2.5, 0.12, 2.4, metal, 17.1, 2.6, 5.8);
+    for (const z of [-3, 13]) this.box(0.14, 9, 18, plaster, 34, 0, z);
+    for (const z of [1, 10]) {
+      this.cyl(0.055, 0.07, 5, metal, 24, 0, z, 8);
+      this.box(0.8, 0.08, 0.25, lamp, 24, 4.95, z);
+      if (!this.isTouch || z === 1) { const l = new THREE.PointLight("#ffe0a3", 12, 13, 1.4); l.position.set(24, 4.8, z); this.scene.add(l); }
+    }
+    for (let i = 0; i < 7; i++) {
+      const puddle = new THREE.Mesh(new THREE.CircleGeometry(0.5 + Math.random(), 24), this.mat({ color: "#70858c", roughness: 0.08, metalness: 0.7, transparent: true, opacity: 0.5 }));
+      puddle.rotation.x = -Math.PI / 2; puddle.scale.y = 0.45; puddle.position.set(19 + i * 1.9, 0.001, 3 + (i % 3) * 2); this.scene.add(puddle);
+    }
+    this.buildCar(metal, dark);
+  }
+
+  private buildCar(metal: THREE.Material, dark: THREE.Material) {
+    const paint = this.mat({ color: "#44685f", metalness: 0.55, roughness: 0.25 });
+    const glass = this.mat({ color: "#6c8790", transparent: true, opacity: 0.34, metalness: 0.25, roughness: 0.12 });
+    this.box(1.85, 0.65, 4.2, paint, 24, 0.32, 6, true);
+    this.box(1.7, 0.18, 1.3, paint, 24, 0.91, 4.55);
+    this.box(1.68, 0.07, 2, paint, 24, 1.55, 6.15);
+    this.box(1.58, 0.55, 0.035, glass, 24, 1.02, 5.15);
+    this.box(1.58, 0.55, 0.035, glass, 24, 1.02, 7.12);
+    for (const x of [23.18, 24.82]) {
+      for (const z of [5.17, 6.13, 7.1]) this.box(0.045, 0.57, 0.045, paint, x, 1.0, z);
+      this.box(0.02, 0.52, 0.88, glass, x, 1.03, 5.66);
+      this.box(0.02, 0.52, 0.86, glass, x, 1.03, 6.62);
+      this.box(0.025, 0.04, 0.16, metal, x, 0.89, 6.08);
+      for (const z of [4.7, 7.35]) {
+        const wheel = this.cyl(0.32, 0.32, 0.22, dark, x, 0, z, 20); wheel.rotation.z = Math.PI / 2; wheel.position.y = 0.35;
+      }
+      this.box(0.17, 0.12, 0.27, paint, x + (x < 24 ? -0.1 : 0.1), 1.07, 5.35);
+    }
+    this.box(1.9, 0.12, 0.12, metal, 24, 0.4, 3.85);
+    this.box(1.9, 0.12, 0.12, metal, 24, 0.4, 8.15);
+    for (const x of [23.35, 24.65]) {
+      this.box(0.38, 0.18, 0.035, new THREE.MeshBasicMaterial({ color: "#d5ddc1" }), x, 0.64, 3.88);
+      this.box(0.32, 0.16, 0.035, this.mat({ color: "#a52d28" }), x, 0.65, 8.12);
+      const beam = new THREE.SpotLight("#fff0c8", 0, 24, 0.4, 0.55, 1.3);
+      beam.position.set(x, 0.78, 3.8); beam.target.position.set(x, 0, -12); this.scene.add(beam, beam.target); this.headlights.push(beam);
+    }
+    // Interior stays modeled: seat, dashboard, steering wheel and ignition.
+    this.box(1.55, 0.26, 0.36, dark, 24, 0.91, 5.25);
+    for (const x of [23.58, 24.42]) {
+      this.box(0.6, 0.18, 0.65, dark, x, 0.5, 6.12);
+      this.box(0.6, 0.6, 0.13, dark, x, 0.64, 6.43);
+    }
+    const wheel = new THREE.Mesh(new THREE.TorusGeometry(0.19, 0.018, 8, 24), dark);
+    wheel.position.set(23.58, 1.01, 5.68); wheel.rotation.x = -0.45; this.scene.add(wheel);
+    this.sign("00", 23.6, 1.05, 5.47, 0.25, 0.12);
+    this.spot("carDoor", new THREE.Vector3(23.05, 1.1, 5.9), () => this.l("Сесть за руль", "Get into the driver's seat"), () => this.departure === "street", () => {
+      this.advanceDeparture("enterCar"); this.sfx.click(); this.sfx.door(); this.pos.set(23.58, 0, 6.08); this.yaw = 0; this.pitch = -0.15;
+      this.caption("Дорога ведёт к старому парку. Пора узнать правду.", "The road leads to the old park. Time to find the truth.");
+    });
+    this.spot("ignition", new THREE.Vector3(23.77, 0.98, 5.54), () => this.l("Повернуть ключ — завести машину", "Turn the key — start the engine"), () => this.departure === "car", () => {
+      this.advanceDeparture("startEngine"); this.sfx.click(); this.motor(24, 0.06);
+      this.headlights.forEach((l) => { l.intensity = this.isTouch ? 12 : 35; });
+      this.caption("Двигатель ожил. Назад дороги нет.", "The engine comes alive. No turning back now.");
+    });
+  }
+
+  private advanceDeparture(action: DepartureAction) {
+    const next = departureNext(this.departure, action);
+    if (next === this.departure) return;
+    this.departure = next; this.departureTime = 0; this.focus = null;
+    if (canBeginMainGame(next)) { this.finished = true; this.cb.onDone(); }
+  }
+  private caption(ru: string, en: string) {
+    this.voice?.pause(); this.subtitle = this.l(ru, en);
+  }
+  private motor(frequency: number, volume: number) {
+    this.engine?.stop();
+    const oscillator = this.sfx.ctx.createOscillator(); const gain = this.sfx.ctx.createGain();
+    oscillator.type = "sawtooth"; oscillator.frequency.value = frequency; gain.gain.value = volume;
+    oscillator.connect(gain).connect(this.sfx.master); oscillator.start(); this.engine = oscillator;
   }
 
   private lightsSetup() {
@@ -498,6 +653,16 @@ export class Apartment {
   private ready() { return ["tv", "phone", "photo", "window"].every((k) => this.done.has(k)); }
   private objective() {
     if (this.finished) return "";
+    const goals: Partial<Record<DepartureStage, string>> = {
+      landing: this.l("7 этаж · Вызвать лифт", "Floor 7 · Call the elevator"),
+      liftOpen: this.l("Войти в лифт и нажать 1", "Enter the lift and press 1"),
+      descending: this.l(`Лифт · Этаж ${this.displayedFloor}`, `Elevator · Floor ${this.displayedFloor}`),
+      ground: this.l("1 этаж · Выйти на улицу", "Floor 1 · Leave the building"),
+      street: this.l("Подойти к своей машине у фонаря", "Reach your car under the streetlight"),
+      car: this.l("Завести машину", "Start the car"),
+      starting: this.l("Двигатель запускается…", "Engine starting…"),
+    };
+    if (goals[this.departure]) return goals[this.departure];
     if (this.done.has("keys")) return this.l("Выйти из квартиры", "Leave the apartment");
     if (this.ready()) return this.l("Взять ключи у входной двери", "Take the keys by the front door");
     const todo: string[] = [];
@@ -545,6 +710,9 @@ export class Apartment {
     this.pitch = Math.max(-1.4, Math.min(1.4, this.pitch - dy * k));
   }
   private blocked(x: number, z: number) {
+    if (this.departure === "descending" || this.departure === "car" || this.departure === "starting" || this.finished) return true;
+    if (x > 8.9 && x < 16.2 && z < 3.28 && z > 2.72 && (this.liftOpening < 0.95 || x < 12.32 || x > 13.28)) return true;
+    if (x < 0.15 || x > 33 || z < (x < 9 ? 0.15 : x < 16 ? 0.95 : -2.5) || z > (x < 16 ? 7.8 : 13.5)) return true;
     for (const [a, b, c, d] of this.boxes) if (x > a - R && x < c + R && z > b - R && z < d + R) return true;
     return false;
   }
@@ -580,6 +748,9 @@ export class Apartment {
     const nx = this.pos.x + (fx * my + rx * mx) * sp, nz = this.pos.z + (fz * my + rz * mx) * sp;
     if (!this.blocked(nx, this.pos.z)) this.pos.x = nx;
     if (!this.blocked(this.pos.x, nz)) this.pos.z = nz;
+    if (this.departure === "apartment" && this.done.has("door") && this.pos.x > 9.35) {
+      this.advanceDeparture("leaveApartment"); this.caption("В подъезде тихо. Нужно спуститься на первый этаж.", "The stairwell is quiet. I need to get to the first floor.");
+    }
     const moving = len > 0.1;
     if (moving) {
       this.stepT -= dt * (sp / dt > WALK ? 1.5 : 1);
@@ -595,7 +766,7 @@ export class Apartment {
     this.focus = null;
     let best = 0.86;
     for (const s of this.spots) {
-      if (!s.ok()) continue;
+      if (!s.ok() || (this.departure !== "apartment" && ["tv", "phone", "photo", "window", "keys", "door"].includes(s.id))) continue;
       const to = s.pos.clone().sub(this.camera.position);
       const d = to.length();
       if (d > 2.2) continue;
@@ -605,6 +776,31 @@ export class Apartment {
   }
 
   private updateFx(dt: number, t: number) {
+    const active = this.isTouch || document.pointerLockElement === this.renderer.domElement;
+    if (active) this.departureTime += dt;
+    const opening = ["liftOpen", "ground"].includes(this.departure) ? 1 : 0;
+    this.liftOpening = THREE.MathUtils.damp(this.liftOpening, opening, 3, dt);
+    this.liftDoors.forEach((door, i) => { door.position.x = (i === 0 ? 12.4 : 13.2) + (i === 0 ? -1 : 1) * this.liftOpening * 0.83; });
+    if (this.departure === "descending") {
+      const floor = Math.max(1, 7 - Math.floor(Math.max(0, this.departureTime - 1.3) / 1.05));
+      if (floor !== this.displayedFloor) {
+        this.displayedFloor = floor; this.sfx.click();
+        for (const texture of [this.liftDisplay, this.floorDisplay]) {
+          const g = texture?.image.getContext("2d");
+          if (g && texture) { g.fillStyle = "#182421"; g.fillRect(0, 0, 256, 128); g.fillStyle = "#dbe6d2"; g.fillText(String(floor), 128, 64); texture.needsUpdate = true; }
+        }
+      }
+      if (active) this.camera.position.y += Math.sin(t * 28) * 0.006;
+      if (this.departureTime > 8.2) {
+        this.engine?.stop(); this.engine = null; this.advanceDeparture("arrive"); this.sfx.pickup(); this.sfx.door();
+        this.caption("Первый этаж. За дверью всё ещё льёт.", "First floor. It's still pouring outside.");
+      }
+    }
+    if (this.departure === "starting" && this.engine) {
+      this.engine.frequency.setTargetAtTime(this.departureTime < 1.5 ? 24 + Math.sin(t * 32) * 7 : 52, this.sfx.ctx.currentTime, 0.1);
+      if (active) this.camera.position.y += Math.sin(t * 35) * 0.003;
+      if (this.departureTime > 4.5) this.advanceDeparture("engineReady");
+    }
     const fl = this.lightning.update(dt);
     this.storm.intensity = fl * 4;
     this.view.color.setRGB(0.6 + fl * 0.8, 0.64 + fl * 0.8, 0.7 + fl * 0.9);
@@ -639,7 +835,7 @@ export class Apartment {
     }
     this.led.color.set(!this.done.has("phone") && Math.sin(t * 6) > 0 ? "#ff2010" : "#300404");
     this.flash.intensity = this.flashOn ? 25 : 0;
-    if (this.finished) {
+    if (this.done.has("door")) {
       this.doorOpen = Math.min(1, this.doorOpen + dt * 0.8);
       this.door.rotation.y = -this.doorOpen * 1.6;
     }
@@ -647,6 +843,7 @@ export class Apartment {
 
   dispose() {
     cancelAnimationFrame(this.raf);
+    this.engine?.stop(); this.engine = null;
     this.voice?.pause();
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);

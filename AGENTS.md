@@ -32,4 +32,5 @@ use the editor.
 - Keep browser-only Three.js scenes dynamically imported by the client-only game route; this prevents SSR evaluation of canvas APIs.
 - Use shared story eligibility helpers for dialogue and ending gates; UI and game state must enforce the same conditions.
 - Ship pre-generated voice audio as static game assets; gameplay must not require credentials or live inference.
+- Keep apartment departure in the existing client-only scene and gate its ordered elevator/street/car stages through shared departure rules; main-game callbacks must wait for engine startup completion.
 - Spawn pickups inside wall-mounted cabinets (props.ts) rather than on the floor; on touch devices keep point lights minimal and use Lambert materials for the bear so shaders compile on phone GPUs.
